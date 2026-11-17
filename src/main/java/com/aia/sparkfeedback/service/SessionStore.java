@@ -112,6 +112,7 @@ public class SessionStore {
     public void advance(UUID id, String nextKey) {
         if (nextKey == null) {
             jdbc.update("UPDATE " + s + ".session SET status = 'COMPLETED', current_question = NULL, unclear_attempts = 0, completed_at = now(), updated_at = now() WHERE id = ?", id);
+            snapshot(id, "COMPLETED");
         } else {
             jdbc.update("UPDATE " + s + ".session SET current_question = ?, unclear_attempts = 0, updated_at = now() WHERE id = ?", nextKey, id);
         }
@@ -119,9 +120,31 @@ public class SessionStore {
 
     /** POC convenience: forget this session's answers and begin again. */
     public void reset(UUID id) {
+        // Keep what the customer already said: a run restarted part-way is saved as RESTARTED (a finished run was saved when it finished).
+        if (answerCount(id) > 0 && !"COMPLETED".equals(load(id).status())) snapshot(id, "RESTARTED");
         jdbc.update("DELETE FROM " + s + ".answer WHERE session_id = ?", id);
         jdbc.update("UPDATE " + s + ".session SET status = 'IN_PROGRESS', questionnaire = NULL, questionnaire_key = NULL, current_question = NULL, "
                 + "unclear_attempts = 0, completed_at = NULL, updated_at = now() WHERE id = ?", id);
+    }
+
+    /** Copies the session's answers, with the customer and policy details, into the permanent submission table. */
+    private void snapshot(UUID id, String status) {
+        jdbc.update("INSERT INTO " + s + ".submission(session_id, policy_no, holder_name, product_name, channel, questionnaire_key, language, status, started_at, finished_at, answers) "
+                + "SELECT se.id, se.policy_no, p.holder_name, p.product_name, se.channel, se.questionnaire_key, se.language, ?, "
+                + AdminStore.RUN_START.formatted(s) + ", " + AdminStore.RUN_END.formatted(s) + ", "
+                + AdminStore.ANSWERS_JSON.formatted(s) + " FROM " + s + ".session se JOIN " + s + ".policy p USING (policy_no) WHERE se.id = ?", status, id);
+    }
+
+    /**
+     * Takes back the customer's latest answer: removes it and makes its question the current one again. Only while the survey is still in
+     * progress. Returns the question that is open again, or empty if there was nothing to take back.
+     */
+    public Optional<String> undoLastAnswer(UUID id) {
+        List<String> last = jdbc.query("DELETE FROM " + s + ".answer WHERE id = (SELECT max(id) FROM " + s + ".answer WHERE session_id = ?) RETURNING question_key",
+                (rs, i) -> rs.getString(1), id);
+        if (last.isEmpty()) return Optional.empty();
+        jdbc.update("UPDATE " + s + ".session SET current_question = ?, unclear_attempts = 0, status = 'IN_PROGRESS', updated_at = now() WHERE id = ?", last.get(0), id);
+        return Optional.of(last.get(0));
     }
 
     // ── answers ──────────────────────────────────────────────────────────────────

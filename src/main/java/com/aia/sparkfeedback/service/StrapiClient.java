@@ -30,12 +30,13 @@ public class StrapiClient {
         this.http = RestClient.builder().requestFactory(f).build();
     }
 
-    /** The published questionnaire for the channel, or null if none is published. */
+    /** The most recently published questionnaire for the channel, or null if none is published. */
     public Questionnaire fetch(String channel) {
         java.net.URI uri = UriComponentsBuilder.fromUriString(baseUrl + "/api/questionnaires")
                 .queryParam("filters[channel][$eq]", channel)
                 .queryParam("populate[questions][populate][0]", "texts")
                 .queryParam("populate[questions][populate][1]", "branches")
+                .queryParam("sort[0]", "publishedAt:desc")          // if a channel has several published, the most recently published one is used
                 .queryParam("pagination[pageSize]", 1)
                 .build().encode().toUri();
         JsonNode root = http.get().uri(uri).retrieve().body(JsonNode.class);
@@ -51,7 +52,13 @@ public class StrapiClient {
                 String next = b.path("next").asText("").trim();
                 branches.add(new Branch(b.path("when").asText("ANY"), next.isEmpty() ? null : next));
             }
-            questions.add(new Question(q.path("key").asText(), q.path("order").asInt(1), q.path("type").asText("YES_NO"), texts, branches));
+            List<Questionnaire.Option> options = new ArrayList<>();
+            for (JsonNode o : q.path("options")) {
+                Map<String, String> ot = new LinkedHashMap<>();
+                for (JsonNode t : o.path("texts")) ot.put(t.path("locale").asText(), t.path("text").asText());
+                options.add(new Questionnaire.Option(o.path("key").asText(), ot));
+            }
+            questions.add(new Question(q.path("key").asText(), q.path("order").asInt(1), q.path("type").asText("YES_NO"), texts, branches, options));
         }
         questions.sort(Comparator.comparingInt(Question::order));
         if (questions.isEmpty()) return null;

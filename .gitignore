@@ -1,10 +1,4 @@
 target/
 .env
-strapi/node_modules/
-strapi/.cache/
-strapi/build/
-strapi/dist/
-strapi/.tmp/
-strapi/public/uploads/
 .idea/
 *.iml

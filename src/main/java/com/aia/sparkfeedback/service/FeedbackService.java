@@ -15,12 +15,14 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.regex.Pattern;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 
 /** Signs the customer in and runs one turn of their own session. Work on one session is serialised; different sessions run in parallel. */
 @Service
 public class FeedbackService {
+    private static final Pattern POLICY_NO = Pattern.compile("[A-Z][0-9]{9}");
 
     public static class LoginException extends RuntimeException {
         public final int status;
@@ -50,7 +52,7 @@ public class FeedbackService {
 
     public LoginResult login(String policyNoRaw, String dobRaw, String language) {
         String policyNo = policyNoRaw == null ? "" : policyNoRaw.trim().toUpperCase();
-        if (policyNo.isEmpty() || policyNo.length() > 40) throw new LoginException(401, "bad");
+        if (!POLICY_NO.matcher(policyNo).matches()) throw new LoginException(401, "bad");   // one letter + 9 digits, e.g. L123456789
         if (throttle.locked(policyNo)) throw new LoginException(429, "locked");
         LocalDate dob;
         try { dob = LocalDate.parse(dobRaw == null ? "" : dobRaw.trim()); } catch (Exception e) { throttle.failed(policyNo); throw new LoginException(401, "bad"); }
@@ -105,6 +107,14 @@ public class FeedbackService {
         });
     }
 
+    /** The customer says their last answer was wrong: take it back and ask that question again. Not possible once the survey is finished. */
+    public Turn undo(UUID id) {
+        return locked(id, () -> {
+            if ("IN_PROGRESS".equals(store.load(id).status())) store.undoLastAnswer(id);
+            return turn(id, null, null, false, false);
+        });
+    }
+
     /** POC convenience: wipe this session's answers and ask again from the first question (the questions are read from Strapi afresh). */
     public Turn restart(UUID id) {
         return locked(id, () -> {
@@ -121,9 +131,30 @@ public class FeedbackService {
         if ("question".equals(what)) {
             if (s.questionnaire() == null || s.currentQuestion() == null) return null;
             Question q = s.questionnaire().find(s.currentQuestion());
-            return q == null ? null : q.text(s.language());
+            return q == null ? null : spoken(q, s.language());
         }
         return ph.get(what);
+    }
+
+    /** What is shown on screen: the question, and for a CHOICE question each option on its own line ("1) ..."). */
+    private static String shown(Question q, String lang) {
+        if (!q.isChoice()) return q.text(lang);
+        StringBuilder sb = new StringBuilder(q.text(lang));
+        for (var o : q.options()) sb.append("\n").append(o.key()).append(") ").append(o.text(lang));
+        return sb.toString();
+    }
+
+    /** What is read aloud: the question, then "Option 1, ...  Option 2, ...". */
+    private static String spoken(Question q, String lang) {
+        if (!q.isChoice()) return q.text(lang);
+        StringBuilder sb = new StringBuilder(q.text(lang));
+        for (var o : q.options()) sb.append(" ").append(Phrases.optionWord(lang)).append(" ").append(o.key()).append(": ").append(o.text(lang)).append(".");
+        return sb.toString();
+    }
+
+    private static List<com.aia.sparkfeedback.model.Views.OptionView> optionViews(Question q, String lang) {
+        if (!q.isChoice()) return List.of();
+        return q.options().stream().map(o -> new com.aia.sparkfeedback.model.Views.OptionView(o.key(), o.text(lang))).toList();
     }
 
     public String language(UUID id) { return store.load(id).language(); }
@@ -133,10 +164,12 @@ public class FeedbackService {
         QuestionView qv = null;
         if ("IN_PROGRESS".equals(s.status()) && s.questionnaire() != null && s.currentQuestion() != null) {
             Question q = s.questionnaire().find(s.currentQuestion());
-            if (q != null) qv = new QuestionView(q.key(), q.type(), q.text(s.language()), store.answerCount(id) + 1);
+            if (q != null) qv = new QuestionView(q.key(), q.type(), shown(q, s.language()), store.answerCount(id) + 1, optionViews(q, s.language()));
         }
         boolean done = "COMPLETED".equals(s.status());
+        Map<String, String> phrases = new HashMap<>(Phrases.of(s.language(), s.customerName()));
+        if (qv != null && (CallScriptTags.LANGUAGE_QUESTION.equals(qv.key()) || (qv.options() != null && !qv.options().isEmpty()))) phrases.put("clarify", Phrases.clarifyChoice(s.language()));
         return new Turn(id.toString(), s.status(), s.language(), s.customerName(), s.channel(), qv, repeat, noSpeech, heard, decision,
-                Phrases.of(s.language(), s.customerName()), done ? store.answers(id) : List.of());
+                phrases, done ? store.answers(id) : List.of());
     }
 }

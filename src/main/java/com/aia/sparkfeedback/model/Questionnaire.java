@@ -10,8 +10,20 @@ import java.util.Map;
 public record Questionnaire(String key, String channel, String title, List<Question> questions) implements java.io.Serializable {
 
     @JsonIgnoreProperties(ignoreUnknown = true)
-    public record Question(String key, int order, String type, Map<String, String> texts, List<Branch> branches) implements java.io.Serializable {
+    public record Question(String key, int order, String type, Map<String, String> texts, List<Branch> branches, List<Option> options) implements java.io.Serializable {
+        public boolean isChoice() { return "CHOICE".equals(type) && options != null && !options.isEmpty(); }
+
         /** The wording in the language, falling back to English. */
+        public String text(String lang) {
+            String t = texts == null ? null : texts.get(lang);
+            if (t == null || t.isBlank()) t = texts == null ? null : texts.get("en");
+            return t == null ? key : t;
+        }
+    }
+
+    /** One pickable answer of a CHOICE question; its key (for example 1) is what the branches match on. */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record Option(String key, Map<String, String> texts) implements java.io.Serializable {
         public String text(String lang) {
             String t = texts == null ? null : texts.get(lang);
             if (t == null || t.isBlank()) t = texts == null ? null : texts.get("en");

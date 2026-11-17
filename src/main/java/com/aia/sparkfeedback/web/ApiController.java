@@ -60,6 +60,10 @@ public class ApiController {
     @PutMapping("/sessions/{id}/language")
     public Turn language(HttpServletRequest req, @RequestBody LanguageRequest l) { return service.setLanguage(sid(req), l.language()); }
 
+    /** Take back the latest answer and ask that question again. */
+    @PostMapping("/sessions/{id}/undo")
+    public Turn undo(HttpServletRequest req) { return service.undo(sid(req)); }
+
     @PostMapping("/sessions/{id}/restart")
     public Turn restart(HttpServletRequest req) { return service.restart(sid(req)); }
 

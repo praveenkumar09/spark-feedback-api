@@ -45,9 +45,16 @@ public class DecisionService {
             Rules:
             - Judge the answer against the exact question. For "Did you feel pressured?", "no, I was fine" is NO; "yes, a bit" is YES.
             - A hedged answer that still leans one way ("I think so", "not really") counts, with lower confidence.
+            - The answer must respond to what THIS question is about. A statement about something else is UNCLEAR even when it sounds positive or negative.
+              Example: question "Do you feel the plan and premium suit your needs?", answer "yes I would recommend it to my friends" -> relevant=false, UNCLEAR.
+              Example: question "Did you receive your documents on time?", answer "the agent was very nice" -> relevant=false, UNCLEAR.
+              A bare "yes" or "no" (or "can lah", "cannot") is relevant to any yes/no question.
+            - Some questions are short fragments that continue the previous topic, for example "Financial situation?" or "Priorities and objectives?".
+              Read them as "Was/Did/Is <fragment> discussed or covered?". An answer that says yes or no, even while repeating the topic
+              ("Yes, my financial situation was discussed"), is relevant and is YES or NO.
             - Answer UNCLEAR when the answer does not address the question, is off topic, is a question back, is genuinely mixed ("some yes some no"), or is gibberish.
             - Never invent an answer the customer did not give.
-            Reply with JSON only: {"decision":"YES"|"NO"|"UNCLEAR","confidence":0.0-1.0,"reason":"<=12 words"}""";
+            Reply with JSON only: {"decision":"YES"|"NO"|"UNCLEAR","confidence":0.0-1.0,"relevant":true|false,"reason":"<=12 words"}""";
 
     private final ChatModel chat;
     private final String deployment;
@@ -88,7 +95,7 @@ public class DecisionService {
             String d = n.path("decision").asText("UNCLEAR").toUpperCase(Locale.ROOT);
             double c = Math.max(0, Math.min(1, n.path("confidence").asDouble(0)));
             if (!d.equals("YES") && !d.equals("NO")) d = "UNCLEAR";
-            if (c < minConfidence) d = "UNCLEAR";
+            if (c < minConfidence || !n.path("relevant").asBoolean(true)) d = "UNCLEAR";
             return new Decision(d, c, n.path("reason").asText(""), true);
         } catch (Exception e) {
             log.warn("Decision model failed, treating the answer as unclear: {}", e.toString());
@@ -96,9 +103,88 @@ public class DecisionService {
         }
     }
 
-    private String call(String user) {
-        var r = chat.call(new Prompt(List.of(new SystemMessage(SYSTEM), new UserMessage(user)),
-                AzureOpenAiChatOptions.builder().deploymentName(deployment).responseFormat(AzureOpenAiResponseFormat.JSON).temperature(0.0).maxTokens(80).build()));
+    private static final String CHOICE_SYSTEM = """
+            You decide which option a customer picked in answer to a multiple-choice feedback question.
+            The customer bought an insurance policy in Singapore and answers by speech (transcribed) or text, in English, Bahasa Melayu, Mandarin or Tamil,
+            often mixed with Singlish. They may say the option number ("one", "number 2", "option 1"), or say the meaning in their own words.
+
+            Rules:
+            - Pick the option whose meaning the customer's answer clearly matches. Do not pick by guessing.
+            - Judge the meaning: "I don't know any of them" matches an option like "Don't know the agent names at all"; "I know my agent" matches an option like "Know the agent".
+            - If the answer fits none of the options, fits more than one, is off topic, is a question back, or is gibberish, answer UNCLEAR.
+            - Never invent an answer the customer did not give.
+            Reply with JSON only: {"choice":"<option key>"|"UNCLEAR","confidence":0.0-1.0,"relevant":true|false,"reason":"<=12 words"}""";
+
+    /** Which option (by key) the customer picked, or UNCLEAR. Spoken or typed option numbers skip the model. */
+    public Decision decideChoice(String question, java.util.List<com.aia.sparkfeedback.model.Questionnaire.Option> options, String answer, String lang) {
+        String cleaned = answer == null ? "" : answer.strip();
+        if (cleaned.isEmpty()) return new Decision("UNCLEAR", 0, "empty", false);
+        String word = cleaned.toLowerCase(Locale.ROOT).replaceAll("[\\p{Punct}\\s。，！？、]+", "");
+        for (var o : options) {
+            if (word.equals(o.key().toLowerCase(Locale.ROOT)) || word.equals("option" + o.key().toLowerCase(Locale.ROOT)) || word.equals("number" + o.key().toLowerCase(Locale.ROOT)))
+                return new Decision(o.key(), 1.0, "option number", false);
+        }
+        StringBuilder sb = new StringBuilder("Language: " + Phrases.languageName(lang) + "\nQuestion: " + question + "\nOptions:\n");
+        for (var o : options) sb.append(o.key()).append(") ").append(o.text("en")).append(" | ").append(o.text(lang)).append("\n");
+        sb.append("Customer's answer: ").append(cleaned);
+        String user = sb.toString();
+        try {
+            CompletableFuture<String> first = CompletableFuture.supplyAsync(() -> callWith(CHOICE_SYSTEM, user), pool);
+            String json;
+            try {
+                json = first.get(4, TimeUnit.SECONDS);
+            } catch (java.util.concurrent.TimeoutException slow) {
+                CompletableFuture<String> second = CompletableFuture.supplyAsync(() -> callWith(CHOICE_SYSTEM, user), pool);
+                json = (String) CompletableFuture.anyOf(first, second).get(25, TimeUnit.SECONDS);
+            }
+            JsonNode n = mapper.readTree(json);
+            String d = n.path("choice").asText("UNCLEAR").trim();
+            double c = Math.max(0, Math.min(1, n.path("confidence").asDouble(0)));
+            final String picked = d;
+            boolean known = options.stream().anyMatch(o -> o.key().equals(picked));
+            if (!known || c < minConfidence || !n.path("relevant").asBoolean(true)) d = "UNCLEAR";
+            return new Decision(d, c, n.path("reason").asText(""), true);
+        } catch (Exception e) {
+            log.warn("Choice decision failed, treating the answer as unclear: {}", e.toString());
+            return new Decision("UNCLEAR", 0, "model unavailable", true);
+        }
+    }
+
+    /** Which of the four languages the customer asked for (en, ms, zh, ta) or UNCLEAR. */
+    public Decision decideLanguage(String answer) {
+        String a = answer == null ? "" : answer.strip().toLowerCase(Locale.ROOT);
+        if (a.isEmpty()) return new Decision("UNCLEAR", 0, "empty", false);
+        Set<String> hits = new java.util.LinkedHashSet<>();
+        if (a.contains("mandarin") || a.contains("chinese") || a.contains("华") || a.contains("中文") || a.contains("普通话") || a.contains("华语")) hits.add("zh");
+        if (a.contains("malay") || a.contains("melayu") || a.contains("bahasa") || a.contains("马来")) hits.add("ms");
+        if (a.contains("tamil") || a.contains("தமிழ்") || a.contains("淡米尔") || a.contains("泰米尔")) hits.add("ta");
+        if (a.contains("english") || a.contains("inggeris") || a.contains("英文") || a.contains("英语")) hits.add("en");
+        if (hits.size() == 1) return new Decision(hits.iterator().next(), 1.0, "language named", false);
+        String user = "Customer's answer: " + answer.strip();
+        try {
+            String json = CompletableFuture.supplyAsync(() -> callWith(LANGUAGE_SYSTEM, user), pool).get(25, TimeUnit.SECONDS);
+            JsonNode n = mapper.readTree(json);
+            String d = n.path("language").asText("UNCLEAR").trim().toLowerCase(Locale.ROOT);
+            double c = Math.max(0, Math.min(1, n.path("confidence").asDouble(0)));
+            if (!Set.of("en", "ms", "zh", "ta").contains(d) || c < minConfidence) return new Decision("UNCLEAR", c, n.path("reason").asText(""), true);
+            return new Decision(d, c, n.path("reason").asText(""), true);
+        } catch (Exception e) {
+            log.warn("Language decision failed, treating the answer as unclear: {}", e.toString());
+            return new Decision("UNCLEAR", 0, "model unavailable", true);
+        }
+    }
+
+    private static final String LANGUAGE_SYSTEM = """
+            A customer was asked which language they prefer for a phone call: Mandarin, Bahasa Malay or Tamil (English is also possible).
+            They may answer in any of these languages, mixed with Singlish, spoken or typed (for example "华语", "bahasa lah", "தமிழ்", "Chinese can").
+            Decide which language they chose. Answer UNCLEAR if no single language is chosen or the answer is off topic.
+            Reply with JSON only: {"language":"en"|"ms"|"zh"|"ta"|"UNCLEAR","confidence":0.0-1.0,"reason":"<=12 words"}""";
+
+    private String call(String user) { return callWith(SYSTEM, user); }
+
+    private String callWith(String system, String user) {
+        var r = chat.call(new Prompt(List.of(new SystemMessage(system), new UserMessage(user)),
+                AzureOpenAiChatOptions.builder().deploymentName(deployment).responseFormat(AzureOpenAiResponseFormat.JSON).temperature(0.0).maxTokens(100).build()));
         return r.getResult().getOutput().getText();
     }
 }

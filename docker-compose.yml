@@ -1,5 +1,6 @@
-# Spark Feedback API stack: the API, its Postgres, and Strapi (the tool that holds the questions).
-# Host ports: API 8090, Postgres 5434, Strapi 1337 (bound to this machine only). They do not clash with the other projects here.
+# Spark Feedback API stack: the API and its Postgres. Strapi (the questions editor) is a separate project: ../spark-feedback-strapi.
+# Start this stack first: it creates the shared network `spark_feedback_net` that Strapi joins.
+# Host ports: API 8090, Postgres 5434. They do not clash with the other projects here.
 
 services:
 
@@ -13,8 +14,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      strapi:
-        condition: service_healthy
     environment:
       AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY}
       AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
@@ -25,7 +24,8 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/spark
       SPRING_DATASOURCE_USERNAME: spark
       SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-spark}
-      STRAPI_URL: http://strapi:1337
+      STRAPI_URL: ${STRAPI_URL:-http://strapi:1337}   # the Strapi stack's container answers to the name `strapi` on the shared network
+      SPARK_ADMIN_PASSWORD: ${SPARK_ADMIN_PASSWORD:-}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3003}
       JAVA_TOOL_OPTIONS: "-Xms256m -Xmx768m"
     healthcheck:
@@ -54,41 +54,9 @@ services:
       timeout: 5s
       retries: 10
 
-  # Strapi Community (MIT): editors change the questions, their wording in 4 languages, and the branches here.
-  strapi:
-    build:
-      context: ./strapi
-    container_name: spark_feedback_strapi
-    ports:
-      - "127.0.0.1:1337:1337"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      NODE_ENV: production
-      HOST: 0.0.0.0
-      PORT: 1337
-      DATABASE_HOST: postgres
-      DATABASE_PORT: 5432
-      DATABASE_NAME: spark
-      DATABASE_USERNAME: spark
-      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-spark}
-      DATABASE_SCHEMA: strapi
-      APP_KEYS: ${STRAPI_APP_KEYS:-spark-key-1,spark-key-2,spark-key-3,spark-key-4}
-      ADMIN_JWT_SECRET: ${STRAPI_ADMIN_JWT_SECRET:-spark-dev-admin-jwt-secret-change-me}
-      API_TOKEN_SALT: ${STRAPI_API_TOKEN_SALT:-spark-dev-api-token-salt-change-me}
-      TRANSFER_TOKEN_SALT: ${STRAPI_TRANSFER_TOKEN_SALT:-spark-dev-transfer-salt-change-me}
-      ENCRYPTION_KEY: ${STRAPI_ENCRYPTION_KEY:-spark-dev-encryption-key-change-me}
-      JWT_SECRET: ${STRAPI_JWT_SECRET:-spark-dev-jwt-secret-change-me}
-      STRAPI_ADMIN_EMAIL: ${STRAPI_ADMIN_EMAIL:-admin@spark.local}
-      STRAPI_ADMIN_PASSWORD: ${STRAPI_ADMIN_PASSWORD:-SparkAdmin#2026}
-      STRAPI_TELEMETRY_DISABLED: "true"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:1337/_health >/dev/null 2>&1 || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 20
-      start_period: 60s
+networks:
+  default:
+    name: spark_feedback_net
 
 volumes:
   spark_feedback_pg_data:

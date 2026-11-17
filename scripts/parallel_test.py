@@ -17,22 +17,22 @@ def call(method, path, body=None, token=None):
 
 # (policy, dob, language, scripted answers by question key, expected path)
 CASES = [
-    ("SG-NF-100234", "1988-03-14", "en",
+    ("L123456789", "1988-03-14", "en",
      {"n1": "No, it was quite complicated", "n2": "The OTP kept failing", "n3": "Yes", "n5": "Yes, I think so", "n7": "Yes", "n8": "Definitely", "n9": "Nothing more"},
      ["n1", "n2", "n3", "n5", "n7", "n8", "n9"]),
-    ("SG-NF-100555", "1995-05-21", "en",
+    ("L678912345", "1995-05-21", "en",
      {"n1": "yes", "n3": "not really", "n4": "yes please", "n5": "no", "n6": "A cheaper plan", "n7": "no", "n8": "maybe not", "n9": "-"},
      ["n1", "n3", "n4", "n5", "n6", "n7", "n8", "n9"]),
-    ("SG-FT-200415", "1979-07-25", "zh",
+    ("M345678912", "1979-07-25", "zh",
      {"f1": "是的", "f3": "是", "f4": "不太清楚", "f5": "费用部分", "f6": "没有", "f8": "会的", "f9": "没有了"},
      ["f1", "f3", "f4", "f5", "f6", "f8", "f9"]),
-    ("SG-FT-200962", "1985-01-30", "ta",
+    ("M456789123", "1985-01-30", "ta",
      {"f1": "இல்லை", "f2": "அடையாள அட்டை காட்டவில்லை", "f3": "ஆம்", "f4": "ஆம்", "f6": "ஆம்", "f7": "கொஞ்சம் அவசரப்படுத்தினார்", "f8": "இல்லை", "f9": "இல்லை"},
      ["f1", "f2", "f3", "f4", "f6", "f7", "f8", "f9"]),
-    ("SG-BC-300118", "1990-09-09", "ms",
+    ("B567891234", "1990-09-09", "ms",
      {"g1": "tidak", "g2": "Proses terlalu lama", "g3": "ya"},
      ["g1", "g2", "g3"]),
-    ("SG-FT-200777", "1983-12-08", "en",
+    ("M789123456", "1983-12-08", "en",
      {"f1": "yes", "f3": "yes", "f4": "what do you mean?", "f6": "no", "f8": "yes", "f9": "great service"},
      None),  # f4 is answered unclearly, then again unclearly twice: stored as UNCLEAR, then default order (f5 next)
 ]
@@ -82,7 +82,7 @@ print("cross-session read ->", st, "(expected 403)")
 st2, _ = call("GET", f"/api/sessions/{a_sid}")
 print("no token ->", st2, "(expected 401)")
 ok = ok and st == 403 and st2 == 401
-st3, r3 = call("POST", "/api/auth/login", {"policyNo": "SG-NF-100234", "dob": "2000-01-01"})
+st3, r3 = call("POST", "/api/auth/login", {"policyNo": "L123456789", "dob": "2000-01-01"})
 print("wrong dob ->", st3, r3)
 ok = ok and st3 == 401
 print("PASS" if ok else "FAIL")

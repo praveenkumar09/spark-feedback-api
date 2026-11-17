@@ -7,7 +7,9 @@ import java.util.Map;
 public final class Views {
     private Views() {}
 
-    public record QuestionView(String key, String type, String text, int number) {}
+    public record OptionView(String key, String text) {}
+
+    public record QuestionView(String key, String type, String text, int number, List<OptionView> options) {}
 
     public record AnswerView(String questionKey, String question, String answer, String decision, String source) {}
 

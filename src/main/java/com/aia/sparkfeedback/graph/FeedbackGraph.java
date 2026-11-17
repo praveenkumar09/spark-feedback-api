@@ -3,8 +3,10 @@ package com.aia.sparkfeedback.graph;
 import com.aia.sparkfeedback.model.Questionnaire;
 import com.aia.sparkfeedback.model.Questionnaire.Branch;
 import com.aia.sparkfeedback.model.Questionnaire.Question;
+import com.aia.sparkfeedback.service.CallScriptTags;
 import com.aia.sparkfeedback.service.DecisionService;
 import com.aia.sparkfeedback.service.DecisionService.Decision;
+import com.aia.sparkfeedback.service.Phrases;
 import com.aia.sparkfeedback.service.SessionStore;
 import com.aia.sparkfeedback.service.SessionStore.Session;
 import com.aia.sparkfeedback.service.StrapiClient;
@@ -19,6 +21,7 @@ import org.springframework.stereotype.Component;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -42,14 +45,16 @@ public class FeedbackGraph {
     private final SessionStore store;
     private final StrapiClient strapi;
     private final DecisionService decisions;
+    private final CallScriptTags tags;
     private final int maxUnclear;
     private final CompiledGraph<State> graph;
 
-    public FeedbackGraph(SessionStore store, StrapiClient strapi, DecisionService decisions,
+    public FeedbackGraph(SessionStore store, StrapiClient strapi, DecisionService decisions, CallScriptTags tags,
                          @Value("${spark.decision.max-unclear-attempts:2}") int maxUnclear) throws Exception {
         this.store = store;
         this.strapi = strapi;
         this.decisions = decisions;
+        this.tags = tags;
         this.maxUnclear = maxUnclear;
         this.graph = build();
     }
@@ -107,7 +112,9 @@ public class FeedbackGraph {
 
     private Map<String, Object> pickFirst(State s) {
         Questionnaire q = s.<Questionnaire>value("questionnaire").orElseThrow();
-        Question first = q.first();
+        Set<String> mine = tags.tagsFor(store.load(id(s)).policyNo());
+        Question first = q.questions().stream().filter(x -> x.order() < CallScriptTags.FOLLOW_UP_ORDER && CallScriptTags.applies(x.key(), mine))
+                .min(java.util.Comparator.comparingInt(Question::order)).orElse(null);
         if (first == null) throw new IllegalStateException("The questionnaire has no questions");
         store.saveQuestionnaire(id(s), q, first.key());
         return Map.of("firstQuestion", first.key());
@@ -125,7 +132,7 @@ public class FeedbackGraph {
         Map<String, Object> out = new HashMap<>();
         out.put("questionText", qText);
         out.put("heard", text);
-        if ("OPEN_TEXT".equals(q.type())) {
+        if ("OPEN_TEXT".equals(q.type()) && !CallScriptTags.LANGUAGE_QUESTION.equals(q.key())) {
             out.put("decision", "TEXT");
             out.put("confidence", 1.0);
             out.put("reask", false);
@@ -133,7 +140,13 @@ public class FeedbackGraph {
         }
         Decision d;
         String choice = s.<String>value("choice").orElse("");
-        if ("BUTTON".equals(source) && (choice.equals("YES") || choice.equals("NO"))) d = new Decision(choice, 1.0, "chosen with a button", false);
+        if (q.isChoice()) {
+            boolean pickedByButton = "BUTTON".equals(source) && q.options().stream().anyMatch(o -> o.key().equals(choice));
+            d = pickedByButton ? new Decision(choice, 1.0, "chosen with a button", false)
+                    : decisions.decideChoice(qText, q.options(), text, session.language());
+        } else if (CallScriptTags.LANGUAGE_QUESTION.equals(q.key())) {
+            d = decisions.decideLanguage(text);
+        } else if ("BUTTON".equals(source) && (choice.equals("YES") || choice.equals("NO"))) d = new Decision(choice, 1.0, "chosen with a button", false);
         else d = decisions.decide(qText, text, session.language());
         out.put("decision", d.decision());
         out.put("confidence", d.confidence());
@@ -149,9 +162,17 @@ public class FeedbackGraph {
 
     private Map<String, Object> storeAnswer(State s) {
         Session session = store.load(id(s));
+        String decided = s.<String>value("decision").orElse("UNCLEAR");
+        if (CallScriptTags.LANGUAGE_QUESTION.equals(session.currentQuestion()) && Phrases.LANGUAGES.contains(decided)) store.setLanguage(session.id(), decided);
         store.saveAnswer(session.id(), session.currentQuestion(), s.<String>value("questionText").orElse(""), s.<String>value("answer").orElse("").strip(),
                 s.<String>value("decision").orElse("UNCLEAR"), s.<Double>value("confidence").orElse(null), s.<String>value("source").orElse("TEXT"), session.language());
         return Map.of();
+    }
+
+    /** The next question in order after this order number that applies to the customer's call-script tags, or null. */
+    private static String nextApplicable(Questionnaire qn, int afterOrder, Set<String> mine) {
+        return qn.questions().stream().filter(x -> x.order() > afterOrder && x.order() < CallScriptTags.FOLLOW_UP_ORDER && CallScriptTags.applies(x.key(), mine))   // follow-ups (order 900+) are reached only by a branch
+                .min(java.util.Comparator.comparingInt(Question::order)).map(Question::key).orElse(null);
     }
 
     /** The first branch whose condition matches wins. No match: the next question in order, or the end if there is none. A question never repeats. */
@@ -170,8 +191,11 @@ public class FeedbackGraph {
                 break;
             }
         }
+        Set<String> mine = tags.tagsFor(session.policyNo());
         if (!matched) {
-            next = qn.questions().stream().filter(x -> x.order() > current.order()).min(java.util.Comparator.comparingInt(Question::order)).map(Question::key).orElse(null);
+            next = nextApplicable(qn, current.order(), mine);
+        } else if (next != null && qn.find(next) != null && !CallScriptTags.applies(next, mine)) {
+            next = nextApplicable(qn, qn.find(next).order(), mine);                    // the branch points at a question this customer's tags skip
         }
         if (next != null && qn.find(next) == null) next = null;                       // a branch pointing at a missing question ends the survey
         if (next != null) {
