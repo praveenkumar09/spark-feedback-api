@@ -132,31 +132,41 @@ public class FeedbackGraph {
         Map<String, Object> out = new HashMap<>();
         out.put("questionText", qText);
         out.put("heard", text);
-        if ("OPEN_TEXT".equals(q.type()) && !CallScriptTags.LANGUAGE_QUESTION.equals(q.key())) {
-            out.put("decision", "TEXT");
+        Decision d;
+        if ("OPEN_TEXT".equals(q.type()) && !CallScriptTags.LANGUAGE_QUESTION.equals(q.key()) && !"VOICE".equals(source)) {
+            out.put("decision", "TEXT");                     // typed: it is the customer's own words
             out.put("confidence", 1.0);
             out.put("reask", false);
             return out;
         }
-        Decision d;
+        boolean openVoice = "OPEN_TEXT".equals(q.type()) && !CallScriptTags.LANGUAGE_QUESTION.equals(q.key());
         String choice = s.<String>value("choice").orElse("");
         if (q.isChoice()) {
             boolean pickedByButton = "BUTTON".equals(source) && q.options().stream().anyMatch(o -> o.key().equals(choice));
             d = pickedByButton ? new Decision(choice, 1.0, "chosen with a button", false)
                     : decisions.decideChoice(qText, q.options(), text, session.language());
+        } else if (openVoice) {
+            d = decisions.decideOpen(qText, text, session.language());   // a spoken answer may be the television: check before saving it
         } else if (CallScriptTags.LANGUAGE_QUESTION.equals(q.key())) {
             d = decisions.decideLanguage(text);
         } else if ("BUTTON".equals(source) && (choice.equals("YES") || choice.equals("NO"))) d = new Decision(choice, 1.0, "chosen with a button", false);
         else d = decisions.decide(qText, text, session.language());
-        out.put("decision", d.decision());
+        boolean interruption = "INTERRUPT".equals(d.decision());
+        boolean noise = "NOISE".equals(d.decision());
+        // Asking to repeat or explain never uses up an attempt; off-topic talk and noise do, so a conversation that wanders eventually moves on.
+        boolean uncounted = interruption && !"OFFTOPIC".equals(d.intent());
+        boolean reask = (uncounted && interruption) || ((interruption || noise || "UNCLEAR".equals(d.decision())) && session.unclearAttempts() < maxUnclear);
+        out.put("decision", reask || !(interruption || noise) ? d.decision() : "UNCLEAR");
         out.put("confidence", d.confidence());
-        out.put("reask", "UNCLEAR".equals(d.decision()) && session.unclearAttempts() < maxUnclear);
+        out.put("reask", reask);
+        out.put("uncounted", uncounted);
+        if (reask && interruption) out.put("reply", d.reply());
         return out;
     }
 
     private Map<String, Object> reask(State s) {
         Session session = store.load(id(s));
-        store.setUnclear(session.id(), session.unclearAttempts() + 1);
+        if (!s.<Boolean>value("uncounted").orElse(false)) store.setUnclear(session.id(), session.unclearAttempts() + 1);
         return Map.of("repeat", true);
     }
 
@@ -170,7 +180,7 @@ public class FeedbackGraph {
     }
 
     /** The next question in order after this order number that applies to the customer's call-script tags, or null. */
-    private static String nextApplicable(Questionnaire qn, int afterOrder, Set<String> mine) {
+    public static String nextApplicable(Questionnaire qn, int afterOrder, Set<String> mine) {
         return qn.questions().stream().filter(x -> x.order() > afterOrder && x.order() < CallScriptTags.FOLLOW_UP_ORDER && CallScriptTags.applies(x.key(), mine))   // follow-ups (order 900+) are reached only by a branch
                 .min(java.util.Comparator.comparingInt(Question::order)).map(Question::key).orElse(null);
     }

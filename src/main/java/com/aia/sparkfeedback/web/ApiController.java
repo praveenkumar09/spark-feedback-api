@@ -49,12 +49,18 @@ public class ApiController {
 
     @PostMapping("/sessions/{id}/answer")
     public Turn answer(HttpServletRequest req, @RequestBody AnswerRequest a) {
-        return service.answer(sid(req), a.questionKey(), a.text(), "BUTTON".equals(a.source()) ? "BUTTON" : "TEXT", a.choice());
+        return service.answer(sid(req), a.questionKey(), a.text(), "BUTTON".equals(a.source()) ? "BUTTON" : "VOICE".equals(a.source()) ? "VOICE" : "TEXT", a.choice());
     }
 
     @PostMapping(value = "/sessions/{id}/answer/audio", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public Turn answerAudio(HttpServletRequest req, @RequestParam("questionKey") String questionKey, @RequestParam("audio") MultipartFile audio) throws Exception {
         return service.answerAudio(sid(req), questionKey, audio.getBytes(), audio.getContentType());
+    }
+
+    /** Speech to text only, so the screen can show what the customer said while the answer is still being worked out. */
+    @PostMapping(value = "/sessions/{id}/transcribe", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public java.util.Map<String, String> transcribe(HttpServletRequest req, @RequestParam("audio") MultipartFile audio) throws Exception {
+        return java.util.Map.of("text", service.transcribe(sid(req), audio.getBytes(), audio.getContentType()));
     }
 
     @PutMapping("/sessions/{id}/language")

@@ -33,13 +33,18 @@ public class FeedbackService {
     private final FeedbackGraph graph;
     private final LoginThrottle throttle;
     private final SpeechService speech;
+    private final CallScriptTags tags;
+    private final java.util.concurrent.ExecutorService warmup = java.util.concurrent.Executors.newFixedThreadPool(3, r -> { Thread t = new Thread(r, "tts-warmup"); t.setDaemon(true); return t; });
     private final ConcurrentHashMap<UUID, ReentrantLock> locks = new ConcurrentHashMap<>();
+    /** What Spark said last in reply to an interruption, so the voice endpoint can read it out. */
+    private final ConcurrentHashMap<UUID, String> lastReply = new ConcurrentHashMap<>();
 
-    public FeedbackService(SessionStore store, FeedbackGraph graph, LoginThrottle throttle, SpeechService speech) {
+    public FeedbackService(SessionStore store, FeedbackGraph graph, LoginThrottle throttle, SpeechService speech, CallScriptTags tags) {
         this.store = store;
         this.graph = graph;
         this.throttle = throttle;
         this.speech = speech;
+        this.tags = tags;
     }
 
     private <T> T locked(UUID id, java.util.function.Supplier<T> work) {
@@ -89,7 +94,12 @@ public class FeedbackService {
             in.put("source", source == null ? "TEXT" : source);
             in.put("choice", choice == null ? "" : choice);
             Map<String, Object> out = graph.run(in);
-            return turn(id, (String) out.get("heard"), (String) out.get("decision"), Boolean.TRUE.equals(out.get("repeat")), false);
+            String decision = (String) out.get("decision");
+            boolean repeat = Boolean.TRUE.equals(out.get("repeat"));
+            if (repeat && "NOISE".equals(decision)) { lastReply.remove(id); return turn(id, null, null, false, true); }   // not the customer: as if nothing was heard
+            String reply = repeat ? (String) out.get("reply") : null;
+            if (reply != null && !reply.isBlank()) lastReply.put(id, reply); else lastReply.remove(id);
+            return turn(id, (String) out.get("heard"), reply != null && !reply.isBlank() ? "INTERRUPT" : decision, repeat, false);
         });
     }
 
@@ -98,6 +108,10 @@ public class FeedbackService {
         String text = speech.transcribe(audio, contentType, s.language());
         if (text.isBlank()) return turn(id, null, null, false, true);
         return answer(id, questionKey, text, "VOICE", null);
+    }
+
+    public String transcribe(UUID id, byte[] audio, String contentType) {
+        return speech.transcribe(audio, contentType, store.load(id).language());
     }
 
     public Turn setLanguage(UUID id, String lang) {
@@ -128,6 +142,7 @@ public class FeedbackService {
     public String sayText(UUID id, String what) {
         Session s = store.load(id);
         Map<String, String> ph = Phrases.of(s.language(), s.customerName());
+        if ("reply".equals(what)) return lastReply.get(id);
         if ("question".equals(what)) {
             if (s.questionnaire() == null || s.currentQuestion() == null) return null;
             Question q = s.questionnaire().find(s.currentQuestion());
@@ -157,6 +172,34 @@ public class FeedbackService {
         return q.options().stream().map(o -> new com.aia.sparkfeedback.model.Views.OptionView(o.key(), o.text(lang))).toList();
     }
 
+    /**
+     * While the customer is answering this question, make the voice for the questions that could come next (each branch, and the next in order),
+     * so whichever is chosen starts speaking at once instead of waiting about 1.5 s for the voice to be generated.
+     */
+    private void prefetchNext(Session s) {
+        if (!speech.ttsEnabled()) return;
+        Question cur = s.questionnaire().find(s.currentQuestion());
+        if (cur == null) return;
+        java.util.Set<String> mine = tags.tagsFor(s.policyNo());
+        java.util.LinkedHashSet<String> keys = new java.util.LinkedHashSet<>();
+        if (cur.branches() != null) for (var b : cur.branches()) if (b.next() != null) keys.add(b.next());
+        String byOrder = FeedbackGraph.nextApplicable(s.questionnaire(), cur.order(), mine);
+        if (byOrder != null) keys.add(byOrder);
+        String lang = s.language();
+        for (String k : keys) {
+            Question nq = s.questionnaire().find(k);
+            if (nq == null) continue;
+            // a branch can point at a question this customer's tags skip: the real next one is the one after it
+            if (!CallScriptTags.applies(nq.key(), mine)) {
+                String after = FeedbackGraph.nextApplicable(s.questionnaire(), nq.order(), mine);
+                nq = after == null ? null : s.questionnaire().find(after);
+                if (nq == null) continue;
+            }
+            final String text = spoken(nq, lang);
+            warmup.submit(() -> { try { speech.speak(text, lang); } catch (Exception ignored) { /* best effort */ } });
+        }
+    }
+
     public String language(UUID id) { return store.load(id).language(); }
 
     private Turn turn(UUID id, String heard, String decision, boolean repeat, boolean noSpeech) {
@@ -166,8 +209,10 @@ public class FeedbackService {
             Question q = s.questionnaire().find(s.currentQuestion());
             if (q != null) qv = new QuestionView(q.key(), q.type(), shown(q, s.language()), store.answerCount(id) + 1, optionViews(q, s.language()));
         }
+        if (qv != null) prefetchNext(s);
         boolean done = "COMPLETED".equals(s.status());
         Map<String, String> phrases = new HashMap<>(Phrases.of(s.language(), s.customerName()));
+        if (repeat && "INTERRUPT".equals(decision) && lastReply.get(id) != null) phrases.put("reply", lastReply.get(id));
         if (qv != null && (CallScriptTags.LANGUAGE_QUESTION.equals(qv.key()) || (qv.options() != null && !qv.options().isEmpty()))) phrases.put("clarify", Phrases.clarifyChoice(s.language()));
         return new Turn(id.toString(), s.status(), s.language(), s.customerName(), s.channel(), qv, repeat, noSpeech, heard, decision,
                 phrases, done ? store.answers(id) : List.of());

@@ -30,7 +30,16 @@ public class DecisionService {
 
     private static final Logger log = LoggerFactory.getLogger(DecisionService.class);
 
-    public record Decision(String decision, double confidence, String reason, boolean viaModel) {}
+    /**
+     * decision: YES, NO, UNCLEAR, or INTERRUPT (the customer asked something instead of answering) or NOISE (not speech meant for Spark).
+     * For INTERRUPT, {@code intent} is REPEAT, EXPLAIN or OFFTOPIC and {@code reply} is what Spark says before asking the question again.
+     */
+    public record Decision(String decision, double confidence, String reason, boolean viaModel, String reply, String intent) {
+        public Decision(String decision, double confidence, String reason, boolean viaModel) { this(decision, confidence, reason, viaModel, null, null); }
+    }
+
+    /** Spark's reply to an interruption is limited to this many characters, whatever the model wrote. */
+    private static final int MAX_REPLY = 320;
 
     private static final Set<String> YES = Set.of("yes", "yeah", "yep", "yup", "y", "sure", "ya", "betul", "ok", "okay",
             "是", "是的", "对", "对的", "有", "好", "好的", "ஆம்", "ஆமாம்", "ஆமா");
@@ -52,9 +61,18 @@ public class DecisionService {
             - Some questions are short fragments that continue the previous topic, for example "Financial situation?" or "Priorities and objectives?".
               Read them as "Was/Did/Is <fragment> discussed or covered?". An answer that says yes or no, even while repeating the topic
               ("Yes, my financial situation was discussed"), is relevant and is YES or NO.
+            - Decide the customer's INTENT first: ANSWER (they are answering), REPEAT (they ask you to repeat, say again or slow down), EXPLAIN (they do not
+              understand the question or ask what it means), OFFTOPIC (they ask or say something else: their policy, a claim, the premium, the agent, small talk),
+              NOISE (background speech, a TV, another person, or fragments clearly not meant for you).
+            - For REPEAT, EXPLAIN and OFFTOPIC write "reply" in the customer's language: at most two short sentences, warm and professional, like a customer
+              service consultant. REPEAT: say you are happy to repeat it. EXPLAIN: say in plain words what this question is asking, using ONLY the words of the
+              question, adding no facts. OFFTOPIC: politely say you can only help with this feedback call, that for anything else about their policy they can call
+              1800 248, and that you will carry on. Never give policy, product, medical, legal, tax or financial advice. Never answer the question for the customer.
+              Do not include the question itself in the reply: it is asked again right after.
+            - For ANSWER and NOISE leave "reply" empty. NOISE means decision UNCLEAR.
             - Answer UNCLEAR when the answer does not address the question, is off topic, is a question back, is genuinely mixed ("some yes some no"), or is gibberish.
             - Never invent an answer the customer did not give.
-            Reply with JSON only: {"decision":"YES"|"NO"|"UNCLEAR","confidence":0.0-1.0,"relevant":true|false,"reason":"<=12 words"}""";
+            Reply with JSON only: {"intent":"ANSWER"|"REPEAT"|"EXPLAIN"|"OFFTOPIC"|"NOISE","decision":"YES"|"NO"|"UNCLEAR","confidence":0.0-1.0,"relevant":true|false,"reply":"","reason":"<=12 words"}""";
 
     private final ChatModel chat;
     private final String deployment;
@@ -80,6 +98,9 @@ public class DecisionService {
         if (YES.contains(word)) return new Decision("YES", 1.0, "plain yes", false);
         if (NO.contains(word)) return new Decision("NO", 1.0, "plain no", false);
 
+        Decision quick = quickYesNo(cleaned);
+        if (quick != null) return quick;
+
         String user = "Language: " + Phrases.languageName(lang) + "\nQuestion: " + question + "\nCustomer's answer: " + cleaned;
         try {
             // Azure now and then leaves a call hanging: a second identical attempt starts after 4 s and the first answer wins.
@@ -92,6 +113,12 @@ public class DecisionService {
                 json = (String) CompletableFuture.anyOf(first, second).get(25, TimeUnit.SECONDS);
             }
             JsonNode n = mapper.readTree(json);
+            String intent = n.path("intent").asText("ANSWER").toUpperCase(Locale.ROOT);
+            String reply = n.path("reply").asText("").strip();
+            if (reply.length() > MAX_REPLY) reply = reply.substring(0, MAX_REPLY).replaceAll("\\s+\\S*$", "") + "…";
+            if (intent.equals("NOISE")) return new Decision("NOISE", 1.0, n.path("reason").asText(""), true, null, intent);
+            if ((intent.equals("REPEAT") || intent.equals("EXPLAIN") || intent.equals("OFFTOPIC")) && !reply.isBlank())
+                return new Decision("INTERRUPT", 1.0, n.path("reason").asText(""), true, reply, intent);
             String d = n.path("decision").asText("UNCLEAR").toUpperCase(Locale.ROOT);
             double c = Math.max(0, Math.min(1, n.path("confidence").asDouble(0)));
             if (!d.equals("YES") && !d.equals("NO")) d = "UNCLEAR";
@@ -174,17 +201,81 @@ public class DecisionService {
         }
     }
 
+    private static final String OPEN_SYSTEM = """
+            A customer of an insurance company in Singapore is answering an OPEN feedback question by voice (transcribed), in English, Bahasa Melayu, Mandarin or Tamil,
+            often mixed with Singlish. The microphone may also have picked up a television, radio or another person in the room.
+            Decide the INTENT of the transcript:
+            - ANSWER: a plausible reply to the question, even if short, informal, negative, or "nothing" / "no comments" / "nope all good".
+            - NOISE: speech that is clearly NOT the customer replying to Spark: news or TV/radio programme text, an advertisement, a conversation between other people,
+              or text about something unrelated to the question and to their policy or agent. A customer's own unrelated chat is OFFTOPIC, not NOISE.
+            - REPEAT: they ask you to repeat or say it again.  EXPLAIN: they do not understand the question or ask what it means.
+            - OFFTOPIC: they ask or say something else directed at you (their policy, a claim, the premium, small talk).
+            For REPEAT, EXPLAIN and OFFTOPIC write "reply" in the customer's language: at most two short sentences, warm and professional. REPEAT: happy to repeat it.
+            EXPLAIN: say in plain words what the question asks, using ONLY the words of the question, adding no facts. OFFTOPIC: politely say you can only help with this
+            feedback call, that for anything else about their policy they can call 1800 248, and that you will carry on. Never give policy, product, medical, legal, tax or
+            financial advice. Do not include the question itself in the reply. For ANSWER and NOISE leave "reply" empty.
+            Reply with JSON only: {"intent":"ANSWER"|"NOISE"|"REPEAT"|"EXPLAIN"|"OFFTOPIC","reply":"","reason":"<=12 words"}""";
+
+    /** For a spoken answer to an open question: ANSWER (decision TEXT), NOISE, or INTERRUPT with a reply. On any failure the words are kept as the answer. */
+    public Decision decideOpen(String question, String answer, String lang) {
+        String cleaned = answer == null ? "" : answer.strip();
+        if (cleaned.isEmpty()) return new Decision("NOISE", 1.0, "empty", false, null, "NOISE");
+        String user = "Language: " + Phrases.languageName(lang) + "\nQuestion: " + question + "\nTranscript: " + cleaned;
+        try {
+            String json = CompletableFuture.supplyAsync(() -> callWith(OPEN_SYSTEM, user), pool).get(20, TimeUnit.SECONDS);
+            JsonNode n = mapper.readTree(json);
+            String intent = n.path("intent").asText("ANSWER").toUpperCase(Locale.ROOT);
+            String reply = n.path("reply").asText("").strip();
+            if (reply.length() > MAX_REPLY) reply = reply.substring(0, MAX_REPLY).replaceAll("\\s+\\S*$", "") + "…";
+            if (intent.equals("NOISE")) return new Decision("NOISE", 1.0, n.path("reason").asText(""), true, null, intent);
+            if ((intent.equals("REPEAT") || intent.equals("EXPLAIN") || intent.equals("OFFTOPIC")) && !reply.isBlank())
+                return new Decision("INTERRUPT", 1.0, n.path("reason").asText(""), true, reply, intent);
+            return new Decision("TEXT", 1.0, "open answer", true);
+        } catch (Exception e) {
+            log.warn("Open-answer check failed, keeping the words as the answer: {}", e.toString());
+            return new Decision("TEXT", 1.0, "check unavailable", true);
+        }
+    }
+
     private static final String LANGUAGE_SYSTEM = """
             A customer was asked which language they prefer for a phone call: Mandarin, Bahasa Malay or Tamil (English is also possible).
             They may answer in any of these languages, mixed with Singlish, spoken or typed (for example "华语", "bahasa lah", "தமிழ்", "Chinese can").
             Decide which language they chose. Answer UNCLEAR if no single language is chosen or the answer is off topic.
             Reply with JSON only: {"language":"en"|"ms"|"zh"|"ta"|"UNCLEAR","confidence":0.0-1.0,"reason":"<=12 words"}""";
 
+    private static final Set<String> QUICK_YES = Set.of("yes", "yeah", "yep", "yup", "ya", "sure", "ok", "okay", "correct", "definitely", "absolutely", "certainly", "right");
+    private static final Set<String> QUICK_NO = Set.of("no", "nope", "nah", "never");
+    private static final Set<String> NEGATIONS = Set.of("not", "no", "nope", "never", "cannot", "dont", "didnt", "doesnt", "wasnt", "werent", "havent", "hadnt", "isnt", "cant", "wont", "nothing", "nobody", "none");
+    /** Words that mean the customer is asking or doubting rather than answering: those always go to the model. */
+    private static final Set<String> CUES = Set.of("what", "why", "how", "who", "when", "where", "which", "repeat", "again", "sorry", "pardon", "mean", "explain",
+            "understand", "confused", "unsure", "maybe", "perhaps", "but", "however", "actually", "wait", "hold", "can", "could", "would", "should", "please", "claim", "premium");
+
+    /**
+     * Short, plain English answers such as "yes, it was explained" or "no, nobody offered me a gift" are decided here, without waiting about 1.5 s for the model.
+     * Anything longer, hedged, negated after a yes, or containing a question or doubt word goes to the model as before.
+     */
+    private static Decision quickYesNo(String text) {
+        if (text.contains("?") || text.length() > 60) return null;
+        String[] w = text.toLowerCase(Locale.ROOT).replaceAll("[\\p{Punct}]", " ").trim().split("\\s+");
+        if (w.length == 0 || w.length > 7) return null;
+        for (String t : w) if (!t.matches("[a-z']+") || CUES.contains(t.replace("'", ""))) return null;
+        String first = w[0];
+        if (QUICK_YES.contains(first)) {
+            for (int i = 1; i < w.length; i++) if (NEGATIONS.contains(w[i].replace("'", ""))) return null;
+            return new Decision("YES", 0.95, "plain yes", false);
+        }
+        if (QUICK_NO.contains(first)) {
+            for (int i = 1; i < w.length; i++) if (QUICK_YES.contains(w[i])) return null;
+            return new Decision("NO", 0.95, "plain no", false);
+        }
+        return null;
+    }
+
     private String call(String user) { return callWith(SYSTEM, user); }
 
     private String callWith(String system, String user) {
         var r = chat.call(new Prompt(List.of(new SystemMessage(system), new UserMessage(user)),
-                AzureOpenAiChatOptions.builder().deploymentName(deployment).responseFormat(AzureOpenAiResponseFormat.JSON).temperature(0.0).maxTokens(100).build()));
+                AzureOpenAiChatOptions.builder().deploymentName(deployment).responseFormat(AzureOpenAiResponseFormat.JSON).temperature(0.0).maxTokens(220).build()));
         return r.getResult().getOutput().getText();
     }
 }
