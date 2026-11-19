@@ -215,6 +215,6 @@ public class FeedbackService {
         if (repeat && "INTERRUPT".equals(decision) && lastReply.get(id) != null) phrases.put("reply", lastReply.get(id));
         if (qv != null && (CallScriptTags.LANGUAGE_QUESTION.equals(qv.key()) || (qv.options() != null && !qv.options().isEmpty()))) phrases.put("clarify", Phrases.clarifyChoice(s.language()));
         return new Turn(id.toString(), s.status(), s.language(), s.customerName(), s.channel(), qv, repeat, noSpeech, heard, decision,
-                phrases, done ? store.answers(id) : List.of());
+                phrases, store.answers(id));      // always: the screen shows the earlier conversation when somebody comes back
     }
 }
