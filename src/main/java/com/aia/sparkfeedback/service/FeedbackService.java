@@ -70,6 +70,9 @@ public class FeedbackService {
         String token = store.newToken();
         UUID id = store.openSession(policy, token);
         return locked(id, () -> {
+            // Signing in begins a NEW conversation from question 1. (Reloading the page in the same tab does not sign in again: it keeps the call going.)
+            Session before = store.load(id);
+            if (store.answerCount(id) > 0 || !"IN_PROGRESS".equals(before.status())) store.reset(id);
             if (language != null && Phrases.LANGUAGES.contains(language)) store.setLanguage(id, language);
             Session s = store.load(id);
             if (s.questionnaire() == null) graph.run(Map.of("sessionId", id.toString(), "phase", "START"));
